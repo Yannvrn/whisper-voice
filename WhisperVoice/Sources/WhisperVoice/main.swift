@@ -2,6 +2,7 @@ import Cocoa
 import AVFoundation
 import Carbon.HIToolbox
 import ApplicationServices
+import UniformTypeIdentifiers
 import os.log
 
 
@@ -245,6 +246,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(actionItem)
 
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Import Audio...", action: #selector(importAudioFile), keyEquivalent: "i"))
         menu.addItem(NSMenuItem(title: "History...", action: #selector(showHistory), keyEquivalent: "h"))
         menu.addItem(NSMenuItem(title: "Preferences...", action: #selector(showPreferences), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Check Permissions...", action: #selector(showPermissionStatus), keyEquivalent: ""))
@@ -873,12 +875,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatus("Transcribing...")
         recordingWindow?.hide()
 
+        let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+        let providerName = config?.provider ?? "unknown"
+        let modeName = (selectedModeForCurrentRecording ?? ModeManager.shared.currentMode).name
+        let savedRecording = RecordingStore.shared.saveRecording(
+            from: audioURL, duration: duration, provider: providerName, modeName: modeName)
+
         transcriptionTimeoutTimer?.invalidate()
         transcriptionTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 45.0, repeats: false) { [weak self] _ in
             DispatchQueue.main.async {
                 if self?.state == .transcribing {
                     LogManager.shared.log("Transcription timeout - resetting state", level: "ERROR")
                     self?.audioRecorder.cleanup()
+                    if let id = savedRecording?.id { RecordingStore.shared.markFailed(id: id, error: "Transcription timeout") }
                     self?.showNotification(title: "Error", message: "Transcription timeout")
                     self?.state = .idle
                     self?.updateStatusIcon()
@@ -911,6 +920,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
                         guard let apiKey = ModeManager.shared.openAIKey else {
                             LogManager.shared.log("No OpenAI API key for processing, using raw text", level: "WARNING")
+                            if let id = savedRecording?.id { RecordingStore.shared.markSuccess(id: id, text: text) }
                             self?.finishWithText(text, rawText: text)
                             return
                         }
@@ -927,19 +937,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                 switch processResult {
                                 case .success(let processedText):
                                     LogManager.shared.log("Processing complete: \(processedText.prefix(50))...")
+                                    if let id = savedRecording?.id { RecordingStore.shared.markSuccess(id: id, text: processedText) }
                                     self?.finishWithText(processedText, rawText: text)
                                 case .failure(let error):
                                     LogManager.shared.log("Processing failed: \(error.localizedDescription), using raw text", level: "WARNING")
+                                    if let id = savedRecording?.id { RecordingStore.shared.markSuccess(id: id, text: text) }
                                     self?.finishWithText(text, rawText: text)
                                 }
                             }
                         }
                     } else {
+                        if let id = savedRecording?.id { RecordingStore.shared.markSuccess(id: id, text: text) }
                         self?.finishWithText(text, rawText: text)
                     }
 
                 case .failure(let error):
                     LogManager.shared.log("Transcription failed: \(error.localizedDescription)", level: "ERROR")
+                    if let id = savedRecording?.id { RecordingStore.shared.markFailed(id: id, error: error.localizedDescription) }
                     self?.showNotification(title: "Error", message: error.localizedDescription)
                     self?.state = .idle
                     self?.updateStatusIcon()
@@ -1212,6 +1226,64 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             historyWindow = HistoryWindow()
         }
         historyWindow?.show()
+    }
+
+    @objc private func importAudioFile() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSOpenPanel()
+        panel.title = "Import Audio File"
+        var types: [UTType] = [.wav, .mp3, .mpeg4Audio, .aiff, .audio]
+        for ext in ["ogg", "webm", "m4a", "flac"] {
+            if let t = UTType(filenameExtension: ext) { types.append(t) }
+        }
+        panel.allowedContentTypes = types
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        LogManager.shared.log("[Import] Importing audio file: \(url.lastPathComponent)")
+
+        guard let config = config, let provider = transcriptionProvider else {
+            showNotification(title: "Error", message: "No transcription provider configured")
+            return
+        }
+
+        let savedRecording = RecordingStore.shared.saveRecording(
+            from: url, duration: 0, provider: config.provider, modeName: "Import")
+
+        state = .transcribing
+        updateStatusIcon()
+        updateStatus("Transcribing imported audio...")
+
+        let vocabPrompt: String? = {
+            guard !config.customVocabulary.isEmpty else { return nil }
+            return config.customVocabulary.joined(separator: ", ")
+        }()
+
+        provider.transcribe(audioURL: url, prompt: vocabPrompt) { [weak self] result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let text):
+                    LogManager.shared.log("[Import] Transcription successful: \(text.prefix(80))...")
+                    if let id = savedRecording?.id { RecordingStore.shared.markSuccess(id: id, text: text) }
+
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(text, forType: .string)
+                    self?.showNotification(title: "Import Complete", message: "Transcription copied to clipboard")
+
+                case .failure(let error):
+                    LogManager.shared.log("[Import] Transcription failed: \(error.localizedDescription)", level: "ERROR")
+                    if let id = savedRecording?.id { RecordingStore.shared.markFailed(id: id, error: error.localizedDescription) }
+                    self?.showNotification(title: "Import Error", message: error.localizedDescription)
+                }
+                self?.state = .idle
+                self?.updateStatusIcon()
+                self?.updateStatus("Idle")
+            }
+        }
     }
 
     @objc private func showPreferences() {

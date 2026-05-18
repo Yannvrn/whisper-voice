@@ -152,7 +152,7 @@ struct ShortcutRecorderRepresentable: NSViewRepresentable {
 // MARK: - Preferences root
 
 enum PreferencePane: String, CaseIterable, Identifiable {
-    case general, shortcuts, modes, autoMode, actions, projects, logs
+    case general, shortcuts, modes, autoMode, actions, projects, recordings, logs
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -162,6 +162,7 @@ enum PreferencePane: String, CaseIterable, Identifiable {
         case .autoMode: return "Auto-mode"
         case .actions: return "Actions"
         case .projects: return "Projects"
+        case .recordings: return "Recordings"
         case .logs: return "Logs"
         }
     }
@@ -173,6 +174,7 @@ enum PreferencePane: String, CaseIterable, Identifiable {
         case .autoMode: return "app.badge.checkmark"
         case .actions: return "bolt.circle"
         case .projects: return "folder"
+        case .recordings: return "waveform.circle"
         case .logs: return "doc.text.magnifyingglass"
         }
     }
@@ -197,8 +199,9 @@ struct PreferencesView: View {
                 case .modes:     ModesPane(store: store)
                 case .autoMode:  AutoModePane(store: store)
                 case .actions:   ActionsPane(store: store)
-                case .projects:  ProjectsPane(store: store)
-                case .logs:      LogsPane()
+                case .projects:    ProjectsPane(store: store)
+                case .recordings:  RecordingsPane()
+                case .logs:        LogsPane()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1088,6 +1091,191 @@ struct ProjectsPane: View {
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         return v.isEmpty ? nil : v
+    }
+}
+
+// MARK: - Recordings pane
+
+@MainActor
+final class RecordingsPaneModel: ObservableObject {
+    @Published var recordings: [RecordingStore.RecordingMetadata] = []
+    @Published var retranscribingId: UUID?
+
+    func reload() {
+        recordings = RecordingStore.shared.getRecordings()
+    }
+
+    func delete(_ recording: RecordingStore.RecordingMetadata) {
+        RecordingStore.shared.deleteRecording(id: recording.id)
+        reload()
+    }
+
+    func retranscribe(_ recording: RecordingStore.RecordingMetadata) {
+        guard RecordingStore.shared.audioExists(for: recording) else { return }
+        guard retranscribingId == nil else { return }
+
+        retranscribingId = recording.id
+
+        let audioURL = RecordingStore.shared.audioURL(for: recording)
+        guard let config = Config.load() else {
+            retranscribingId = nil
+            return
+        }
+
+        let provider = TranscriptionProviderFactory.create(from: config)
+
+        let vocabPrompt: String? = {
+            guard !config.customVocabulary.isEmpty else { return nil }
+            return config.customVocabulary.joined(separator: ", ")
+        }()
+
+        provider.transcribe(audioURL: audioURL, prompt: vocabPrompt) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .success(let text):
+                    RecordingStore.shared.markSuccess(id: recording.id, text: text)
+                    LogManager.shared.log("[RecordingsPane] Re-transcription successful for \(recording.id)")
+
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(text, forType: .string)
+
+                case .failure(let error):
+                    RecordingStore.shared.markFailed(id: recording.id, error: error.localizedDescription)
+                    LogManager.shared.log("[RecordingsPane] Re-transcription failed: \(error.localizedDescription)", level: "ERROR")
+                }
+                self.retranscribingId = nil
+                self.reload()
+            }
+        }
+    }
+}
+
+struct RecordingsPane: View {
+    @StateObject private var model = RecordingsPaneModel()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Last 5 recordings are kept so you can retry if transcription fails.")
+                .font(.callout)
+                .foregroundColor(.secondary)
+
+            if model.recordings.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Image(systemName: "waveform.slash")
+                        .font(.system(size: 32))
+                        .foregroundColor(.secondary)
+                    Text("No recordings saved yet")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                List {
+                    ForEach(model.recordings, id: \.id) { recording in
+                        RecordingRow(
+                            recording: recording,
+                            isRetranscribing: model.retranscribingId == recording.id,
+                            onRetranscribe: { model.retranscribe(recording) },
+                            onDelete: { model.delete(recording) }
+                        )
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .onAppear { model.reload() }
+    }
+}
+
+struct RecordingRow: View {
+    let recording: RecordingStore.RecordingMetadata
+    let isRetranscribing: Bool
+    let onRetranscribe: () -> Void
+    let onDelete: () -> Void
+
+    private var statusIcon: String {
+        switch recording.transcriptionStatus {
+        case "success": return "checkmark.circle.fill"
+        case "failed": return "xmark.circle.fill"
+        default: return "clock"
+        }
+    }
+
+    private var statusColor: Color {
+        switch recording.transcriptionStatus {
+        case "success": return .green
+        case "failed": return .red
+        default: return .orange
+        }
+    }
+
+    private var formattedDate: String {
+        let f = DateFormatter()
+        f.dateStyle = .short
+        f.timeStyle = .medium
+        return f.string(from: recording.timestamp)
+    }
+
+    private var formattedDuration: String {
+        let secs = Int(recording.durationSeconds)
+        if secs < 60 { return "\(secs)s" }
+        return "\(secs / 60)m \(secs % 60)s"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Image(systemName: statusIcon)
+                    .foregroundColor(statusColor)
+                    .font(.body)
+                Text(formattedDate)
+                    .font(.headline)
+                Text("(\(formattedDuration))")
+                    .foregroundColor(.secondary)
+                Text("— \(recording.provider) / \(recording.modeName)")
+                    .foregroundColor(.secondary)
+                    .font(.caption)
+                Spacer()
+
+                if isRetranscribing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    if RecordingStore.shared.audioExists(for: recording) {
+                        Button(action: onRetranscribe) {
+                            Label("Retry", systemImage: "arrow.clockwise")
+                        }
+                        .help("Re-transcribe this recording")
+                    }
+                }
+
+                Button(action: onDelete) {
+                    Image(systemName: "trash")
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.borderless)
+                .help("Delete recording")
+            }
+
+            if let text = recording.transcribedText, !text.isEmpty {
+                Text(text)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+            }
+
+            if let error = recording.lastError {
+                Text("Error: \(error)")
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 

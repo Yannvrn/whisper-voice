@@ -60,8 +60,9 @@ class MistralProvider: BaseTranscriptionProvider, TranscriptionProvider {
                 LogManager.shared.log("[\(self.displayName)] Request failed (attempt \(attempt)): \(error.localizedDescription)", level: "ERROR")
 
                 if attempt < self.maxRetries {
-                    LogManager.shared.log("[\(self.displayName)] Retrying in 1 second...")
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
+                    let delay = self.retryDelay(attempt: attempt)
+                    LogManager.shared.log("[\(self.displayName)] Retrying in \(String(format: "%.0f", delay))s...")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                         self.transcribeWithRetry(audioURL: audioURL, prompt: prompt, attempt: attempt + 1, completion: completion)
                     }
                 } else {
@@ -74,8 +75,9 @@ class MistralProvider: BaseTranscriptionProvider, TranscriptionProvider {
                 LogManager.shared.log("[\(self.displayName)] Response status: \(httpResponse.statusCode)")
 
                 if httpResponse.statusCode >= 500 && attempt < self.maxRetries {
-                    LogManager.shared.log("[\(self.displayName)] Server error, retrying...")
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
+                    let delay = self.retryDelay(attempt: attempt)
+                    LogManager.shared.log("[\(self.displayName)] Server error, retrying in \(String(format: "%.0f", delay))s...")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                         self.transcribeWithRetry(audioURL: audioURL, prompt: prompt, attempt: attempt + 1, completion: completion)
                     }
                     return

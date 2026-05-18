@@ -208,6 +208,7 @@ class TextProcessor {
     static let shared = TextProcessor()
 
     private let endpoint = URL(string: "https://api.openai.com/v1/chat/completions")!
+    private let maxRetries = 3
 
     /// Available LLM models for processing. Ordered cheapest/fastest → premium,
     /// with legacy families kept at the bottom for users who already rely on them.
@@ -324,11 +325,39 @@ class TextProcessor {
         request.httpBody = jsonData
         request.timeoutInterval = 30
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        executeWithRetry(request: request, originalText: text, attempt: 1, completion: completion)
+    }
+
+    private func executeWithRetry(request: URLRequest, originalText: String, attempt: Int, completion: @escaping (Result<String, Error>) -> Void) {
+        LogManager.shared.log("[TextProcessor] Request attempt \(attempt)/\(maxRetries)")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+
             if let error = error {
-                LogManager.shared.log("[TextProcessor] Network error: \(error.localizedDescription)")
-                completion(.failure(error))
+                LogManager.shared.log("[TextProcessor] Network error (attempt \(attempt)): \(error.localizedDescription)")
+                if attempt < self.maxRetries {
+                    let delay = pow(2.0, Double(attempt - 1))
+                    LogManager.shared.log("[TextProcessor] Retrying in \(String(format: "%.0f", delay))s...")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        self.executeWithRetry(request: request, originalText: originalText, attempt: attempt + 1, completion: completion)
+                    }
+                } else {
+                    completion(.failure(error))
+                }
                 return
+            }
+
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode >= 500 {
+                LogManager.shared.log("[TextProcessor] Server error \(httpResponse.statusCode) (attempt \(attempt))")
+                if attempt < self.maxRetries {
+                    let delay = pow(2.0, Double(attempt - 1))
+                    LogManager.shared.log("[TextProcessor] Retrying in \(String(format: "%.0f", delay))s...")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        self.executeWithRetry(request: request, originalText: originalText, attempt: attempt + 1, completion: completion)
+                    }
+                    return
+                }
             }
 
             guard let data = data else {
@@ -343,8 +372,8 @@ class TextProcessor {
                    let message = firstChoice["message"] as? [String: Any],
                    let content = message["content"] as? String {
                     let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let changed = trimmed != text
-                    LogManager.shared.log("[TextProcessor] SUCCESS \(text.count)→\(trimmed.count) chars  changed=\(changed)")
+                    let changed = trimmed != originalText
+                    LogManager.shared.log("[TextProcessor] SUCCESS \(originalText.count)→\(trimmed.count) chars  changed=\(changed)")
                     LogManager.shared.log("[TextProcessor] OUTPUT: \(trimmed)")
                     completion(.success(trimmed))
                 } else if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],

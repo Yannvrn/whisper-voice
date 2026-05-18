@@ -62,6 +62,10 @@ class BaseTranscriptionProvider {
         return nil
     }
 
+    func retryDelay(attempt: Int) -> TimeInterval {
+        pow(2.0, Double(attempt - 1))
+    }
+
     func createMultipartBody(boundary: String, audioData: Data, model: String, prompt: String? = nil) -> Data {
         var body = Data()
 
